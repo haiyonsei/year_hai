@@ -1,0 +1,21 @@
+# -----------------------
+# keep directories, ignore their contents
+# -----------------------
+/data/*
+!/data/.gitkeep
+
+/experiments/*
+!/experiments/.gitkeep
+
+# -----------------------
+# common ignores (optional)
+# -----------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.build/
+dist/
+.DS_Store
+Thumbs.db
+.vscode/
+
