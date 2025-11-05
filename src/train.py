@@ -188,8 +188,8 @@ def main(args):
 
     # --- Optim / Sched / Loss / Loader ---
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    #scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.step_size, gamma=args.gamma)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=0.0)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.step_size, gamma=args.gamma)
+    #scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=0.0)
     criterion = nn.MSELoss()
 
     train_loader = DataLoader(TensorDataset(X_train_t, Y_train_t), batch_size=args.batch_size, shuffle=True)
