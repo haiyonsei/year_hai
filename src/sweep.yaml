@@ -1,0 +1,24 @@
+program: train_inverse.py
+method: bayes
+metric:
+  name: val_bit_acc
+  goal: maximize
+
+parameters:
+  d_model:
+    values: [128, 256, 384]
+  dim_ff:
+    values: [256, 512, 768]
+  num_layers:
+    values: [3, 6, 9, 12, 20, 30]
+  nhead:
+    values: [4, 8, 16]
+  dropout:
+    values: [0.0, 0.1]
+
+  lr:
+    values: [1e-3, 3e-4]
+  batch_size:
+    values: [64, 128]
+
+run_cap: 100
