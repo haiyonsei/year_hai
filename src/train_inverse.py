@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 import wandb
 
 BOS_IDX = 2   # 0,1: 실제 비트, 2: BOS 토큰
+H, W = 4, 4   # 4x4 패턴
 
 
 # ---------------------------
@@ -32,6 +33,65 @@ def restore_pixel_order(X_flat):
 
 
 # ---------------------------
+# Ordering utilities
+# ---------------------------
+def get_order_indices(ordering, num_bits, height=H, width=W):
+    """
+    4x4 grid 상에서의 순회 순서를 정의.
+    반환: order_idx (np.array of shape (num_bits,))
+      - order_idx[t] = original flattened index at AR position t
+    ordering:
+      - 'raster': 0,1,2,...,15
+      - 'snake' : row별로 L-R, R-L 번갈아
+      - 'hilbert': 4x4 Hilbert curve
+    """
+    assert num_bits == height * width == 16, "현재는 4x4(16비트)만 지원"
+
+    if ordering == "raster":
+        order = np.arange(num_bits, dtype=np.int64)
+
+    elif ordering == "snake":
+        order = []
+        for r in range(height):
+            if r % 2 == 0:
+                cols = range(width)
+            else:
+                cols = reversed(range(width))
+            for c in cols:
+                idx = r * width + c
+                order.append(idx)
+        order = np.array(order, dtype=np.int64)
+
+    elif ordering == "hilbert":
+        # 4x4 Hilbert curve 경로 (x,y in [0,3], flat idx = y*4 + x)
+        hilbert_coords = [
+            (0, 0),
+            (1, 0),
+            (1, 1),
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 3),
+            (1, 2),
+            (2, 2),
+            (2, 3),
+            (3, 3),
+            (3, 2),
+            (3, 1),
+            (2, 1),
+            (2, 0),
+            (3, 0),
+        ]
+        order = np.array([y * width + x for (x, y) in hilbert_coords], dtype=np.int64)
+
+    else:
+        raise ValueError(f"Unknown ordering: {ordering}")
+
+    assert len(order) == num_bits
+    return order
+
+
+# ---------------------------
 # 작은 Transformer AR 모델
 # ---------------------------
 class SmallTransformerAR(nn.Module):
@@ -40,8 +100,12 @@ class SmallTransformerAR(nn.Module):
       - 입력 토큰: [BOS, x0, x1, ..., x14] (길이 L = 16, num_bits=16 가정)
       - 출력: 각 위치 t에서 '다음 비트 x_t'에 대한 logit (길이 L = 16)
         logits[:,0] -> x0, logits[:,1] -> x1, ..., logits[:,15] -> x15
-      - 조건: y (S11 스펙트럼) → Linear → d_model → 모든 토큰 embedding에 더함
+      - 조건: y (S11 스펙트럼) → cond_encoder → d_model → 모든 토큰 embedding에 더함
       - causal mask 사용 (i 위치는 <= i만 attend)
+      - spectral_cond:
+          * 'linear'     : Linear(num_points → d_model)
+          * 'mlp'        : 2-layer MLP
+          * 'transformer': small Transformer encoder over freq dimension
     """
     def __init__(
         self,
@@ -53,16 +117,43 @@ class SmallTransformerAR(nn.Module):
         max_len=16,      # = num_bits
         vocab_size=3,    # 0,1,BOS
         dropout=0.1,
+        spectral_cond="linear",   # 'linear' or 'mlp' or 'transformer'
     ):
         super().__init__()
         self.num_points = num_points
         self.d_model = d_model
         self.max_len = max_len
+        self.spectral_cond_type = spectral_cond
 
         # 토큰/포지션/컨디션 임베딩
         self.token_embed = nn.Embedding(vocab_size, d_model)
         self.pos_embed   = nn.Embedding(max_len, d_model)
-        self.cond_linear = nn.Linear(num_points, d_model)
+
+        if spectral_cond == "linear":
+            self.cond_encoder = nn.Linear(num_points, d_model)
+        elif spectral_cond == "mlp":
+            self.cond_encoder = nn.Sequential(
+                nn.Linear(num_points, d_model),
+                nn.ReLU(),
+                nn.Linear(d_model, d_model),
+            )
+        elif spectral_cond == "transformer":
+            # y: (B, num_points) → (B, num_points, 1) → proj → +pos → TransformerEncoder → mean-pool
+            self.freq_in_proj = nn.Linear(1, d_model)
+            self.freq_pos_embed = nn.Embedding(num_points, d_model)
+            cond_encoder_layer = nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=4,                   # 작은 헤드 수 (별도 하이퍼로 빼고 싶으면 인자로 추가 가능)
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                batch_first=True
+            )
+            self.cond_transformer = nn.TransformerEncoder(
+                cond_encoder_layer,
+                num_layers=2
+            )
+        else:
+            raise ValueError(f"Unknown spectral_cond: {spectral_cond}")
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -84,6 +175,30 @@ class SmallTransformerAR(nn.Module):
         mask = torch.triu(torch.ones(L, L, dtype=torch.bool, device=device), diagonal=1)
         return mask
 
+    def encode_condition(self, y):
+        """
+        y: (B, num_points)
+        반환: cond_vec: (B, d_model)
+        """
+        if self.spectral_cond_type in ["linear", "mlp"]:
+            return self.cond_encoder(y)  # (B,d_model)
+        elif self.spectral_cond_type == "transformer":
+            B, P = y.shape
+            device = y.device
+            y_seq = y.unsqueeze(-1)                 # (B,P,1)
+            feat = self.freq_in_proj(y_seq)        # (B,P,d_model)
+
+            pos_idx = torch.arange(P, device=device).unsqueeze(0).expand(B, P)
+            pos_emb = self.freq_pos_embed(pos_idx) # (B,P,d_model)
+
+            feat = feat + pos_emb                  # (B,P,d_model)
+            h = self.cond_transformer(feat)        # (B,P,d_model)
+
+            cond_vec = h.mean(dim=1)               # (B,d_model) global average pooling
+            return cond_vec
+        else:
+            raise RuntimeError("Invalid spectral_cond_type")
+
     def forward(self, y, tokens):
         """
         y:      (B, num_points)
@@ -98,8 +213,8 @@ class SmallTransformerAR(nn.Module):
         pos_idx = torch.arange(L, device=device).unsqueeze(0).expand(B, L)  # (B,L)
         pos_emb = self.pos_embed(pos_idx)               # (B,L,d_model)
 
-        cond = self.cond_linear(y)                      # (B,d_model)
-        cond = cond.unsqueeze(1).expand(B, L, self.d_model)  # (B,L,d_model)
+        cond_vec = self.encode_condition(y)             # (B,d_model)
+        cond = cond_vec.unsqueeze(1).expand(B, L, self.d_model)  # (B,L,d_model)
 
         x = tok_emb + pos_emb + cond                    # (B,L,d_model)
 
@@ -122,7 +237,7 @@ def train_one_epoch_transformer(model, loader, criterion, optimizer, device):
     total_pattern_acc = 0.0
 
     for yb, xb in loader:
-        # yb: (B, num_points), xb: (B,16) {0,1}
+        # yb: (B, num_points), xb: (B,16) {0,1}  (이미 ordering 적용된 상태)
         yb = yb.to(device)
         xb = xb.to(device)
         B, num_bits = xb.shape
@@ -202,11 +317,14 @@ def eval_transformer(model, loader, criterion, device):
 
 # ---------------------------
 # 샘플링: y 주어졌을 때 X 시퀀스를 AR로 생성
+#   - 내부 체인 순서는 ordering 기준
+#   - 반환은 "original flatten ordering" (0..15) 기준
 # ---------------------------
-def sample_transformer_ar(model, y, num_bits=16, greedy=False):
+def sample_transformer_ar(model, y, num_bits=16, greedy=False,
+                          ordering="raster", height=H, width=W):
     """
     y: (B, num_points)
-    반환: 샘플링된 X_flat: (B,16)  in {0,1}
+    반환: 샘플링된 X_flat: (B,16) in {0,1}, original flatten ordering
     """
     model.eval()
     device = next(model.parameters()).device
@@ -216,7 +334,7 @@ def sample_transformer_ar(model, y, num_bits=16, greedy=False):
     # 시작 토큰: [BOS]
     tokens = torch.full((B, 1), BOS_IDX, dtype=torch.long, device=device)
 
-    bits = []
+    bits_chain = []
     with torch.no_grad():
         for t in range(num_bits):
             # tokens: [BOS, x0, ..., x_{t-1}]  (길이 t+1 <= 16)
@@ -229,12 +347,51 @@ def sample_transformer_ar(model, y, num_bits=16, greedy=False):
             else:
                 x_t = torch.bernoulli(probs).long()
 
-            bits.append(x_t.unsqueeze(1))  # (B,1)
+            bits_chain.append(x_t.unsqueeze(1))  # (B,1)
 
             tokens = torch.cat([tokens, x_t.unsqueeze(1)], dim=1)  # prefix 확장
 
-    bits = torch.cat(bits, dim=1)          # (B,16)
-    return bits
+    bits_chain = torch.cat(bits_chain, dim=1)  # (B,16) in chain-order
+
+    # chain-order → original-order 로 역변환
+    order_idx_np = get_order_indices(ordering, num_bits, height, width)
+    order_idx = torch.from_numpy(order_idx_np).to(device)  # (16,)
+    bits_flat = torch.zeros_like(bits_chain)
+    bits_flat[:, order_idx] = bits_chain
+
+    return bits_flat  # original flatten ordering
+
+
+# ---------------------------
+# Top-k pattern accuracy via sampling
+# ---------------------------
+def eval_topk_pattern_accuracy(model, Y_test_t, X_test_flat, k, device,
+                               ordering="raster", num_bits=16):
+    """
+    각 test sample에 대해 k번 샘플링했을 때,
+    그 중 하나라도 GT 패턴과 완전히 일치하면 correct로 카운트.
+    """
+    model.eval()
+    N = Y_test_t.size(0)
+    X_test_flat_t = torch.tensor(X_test_flat, device=device).float()
+    correct = 0
+
+    with torch.no_grad():
+        for i in range(N):
+            y_i = Y_test_t[i:i+1].to(device)          # (1,num_points)
+            y_rep = y_i.repeat(k, 1)                  # (k,num_points)
+            samples = sample_transformer_ar(
+                model, y_rep, num_bits=num_bits,
+                greedy=False, ordering=ordering
+            )                                         # (k,16)
+
+            gt = X_test_flat_t[i].unsqueeze(0).repeat(k, 1)  # (k,16)
+            match = (samples == gt).all(dim=1)               # (k,)
+            if match.any():
+                correct += 1
+
+    topk_acc = correct / N
+    return topk_acc
 
 
 # ---------------------------
@@ -250,7 +407,7 @@ def main(args):
     val_data   = np.load(os.path.join(data_root, "validation", "validation_data.npz"), mmap_mode='r')
     test_data  = np.load(os.path.join(data_root, "test", "test_data.npz"), mmap_mode='r')
 
-    X_train_flat = train_data["X"].astype(np.float32)  # (N,16) binary {0,1}
+    X_train_flat = train_data["X"].astype(np.float32)  # (N,16) binary {0,1} in original ordering
     Y_train      = train_data["Y"].astype(np.float32)  # (N,num_points)
     X_val_flat   = val_data["X"].astype(np.float32)
     Y_val        = val_data["Y"].astype(np.float32)
@@ -262,27 +419,33 @@ def main(args):
     print(f"✅ Dataset loaded: train={len(X_train_flat)}, val={len(X_val_flat)}, test={len(X_test_flat)}, "
           f"num_points={num_points}, num_bits={num_bits}")
 
+    # --- ordering: original → chain-order 로 permute ---
+    order_idx = get_order_indices(args.ordering, num_bits, H, W)  # (16,)
+    print(f"🔁 Using ordering = {args.ordering}, order_idx = {order_idx.tolist()}")
+
+    X_train_ord = X_train_flat[:, order_idx]
+    X_val_ord   = X_val_flat[:, order_idx]
+    X_test_ord  = X_test_flat[:, order_idx]
+
     # --- per-sample 입력 normalization (옵션) ---
     if args.normalize_input:
-        eps = 1e-8
-        # 각 sample에 대해 (freq dimension) 평균 0, 표준편차 1로
+        # 각 sample에 대해 (freq dimension) 평균 0 (원하면 std로 나누는 것도 가능)
         def norm_per_sample(Y):
             mean = Y.mean(axis=1, keepdims=True)
-            #std = Y.std(axis=1, keepdims=True) + eps
-            return (Y - mean) #/ std
+            return (Y - mean)
 
         Y_train = norm_per_sample(Y_train)
         Y_val   = norm_per_sample(Y_val)
         Y_test  = norm_per_sample(Y_test)
         print("🔧 Per-sample normalization applied to Y (train/val/test).")
 
-    # torch tensor
+    # torch tensor (주의: X_*_ord 사용)
     Y_train_t = torch.tensor(Y_train)
-    X_train_t = torch.tensor(X_train_flat)
+    X_train_t = torch.tensor(X_train_ord)
     Y_val_t   = torch.tensor(Y_val)
-    X_val_t   = torch.tensor(X_val_flat)
+    X_val_t   = torch.tensor(X_val_ord)
     Y_test_t  = torch.tensor(Y_test)
-    X_test_t  = torch.tensor(X_test_flat)
+    X_test_t  = torch.tensor(X_test_ord)
 
     train_loader = DataLoader(TensorDataset(Y_train_t, X_train_t),
                               batch_size=args.batch_size, shuffle=True)
@@ -295,13 +458,14 @@ def main(args):
     run_name = (
         f"{args.run_prefix}-"
         f"L{args.num_layers}-d{args.d_model}-h{args.nhead}-ff{args.dim_ff}-"
-        f"dr{args.dropout}-lr{args.lr}-bs{args.batch_size}"
+        f"dr{args.dropout}-ord{args.ordering}-spec{args.spectral_cond}-"
+        f"lr{args.lr}-bs{args.batch_size}"
     )
     wandb.init(project=args.project, name=run_name)
     # 하이퍼파라미터 sweep-friendly: 모든 args를 config에 기록
     wandb.config.update(vars(args))
 
-    # --- Model / Loss / Optim ---
+    # --- Model / Loss / Optim / LR Scheduler ---
     model = SmallTransformerAR(
         num_points=num_points,
         d_model=args.d_model,
@@ -311,6 +475,7 @@ def main(args):
         max_len=num_bits,   # =16
         vocab_size=3,
         dropout=args.dropout,
+        spectral_cond=args.spectral_cond,
     ).to(device)
 
     print(model)
@@ -318,8 +483,17 @@ def main(args):
     criterion = nn.BCEWithLogitsLoss()
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
+    scheduler = None
+    if args.lr_scheduler == "cosine":
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs, eta_min=0.0
+        )
+
     os.makedirs(args.save_dir, exist_ok=True)
-    save_path = os.path.join(args.save_dir, "transformer_ar_inverse.pth")
+    #save_path = os.path.join(args.save_dir, "transformer_ar_inverse.pth")
+    run_save_dir = os.path.join(args.save_dir, run_name)
+    os.makedirs(run_save_dir, exist_ok=True)
+    save_path = os.path.join(run_save_dir, "best_model.pth")
 
     best_val_loss = float("inf")
 
@@ -332,12 +506,16 @@ def main(args):
             model, val_loader, criterion, device
         )
 
+        current_lr = optimizer.param_groups[0]["lr"]
+
         print(f"[Epoch {epoch:03d}/{args.epochs}] "
               f"Train Loss: {train_loss:.6f}, BitAcc: {train_bit_acc:.4f}, PatAcc: {train_pat_acc:.4f} | "
-              f"Val Loss: {val_loss:.6f}, BitAcc: {val_bit_acc:.4f}, PatAcc: {val_pat_acc:.4f}")
+              f"Val Loss: {val_loss:.6f}, BitAcc: {val_bit_acc:.4f}, PatAcc: {val_pat_acc:.4f} | "
+              f"lr={current_lr:.3e}")
 
         wandb.log({
             "epoch": epoch,
+            "lr": current_lr,
             "train_loss": train_loss,
             "train_bit_acc": train_bit_acc,
             "train_pattern_acc": train_pat_acc,
@@ -351,6 +529,9 @@ def main(args):
             torch.save(model.state_dict(), save_path)
             print(f"  💾 Best model updated & saved to {save_path}")
             wandb.run.summary["best_val_loss"] = best_val_loss
+
+        if scheduler is not None:
+            scheduler.step()
 
     # --- Test ---
     print("🔍 Evaluating best model on test set...")
@@ -369,14 +550,27 @@ def main(args):
     wandb.run.summary["test_bit_acc"] = test_bit_acc
     wandb.run.summary["test_pattern_acc"] = test_pat_acc
 
+    # --- Top-k pattern accuracy via sampling ---
+    print(f"🎯 Evaluating Top-{args.topk} pattern accuracy via sampling...")
+    topk_acc = eval_topk_pattern_accuracy(
+        model, Y_test_t, X_test_flat, k=args.topk, device=device,
+        ordering=args.ordering, num_bits=num_bits
+    )
+    print(f"📈 Top-{args.topk} Pattern Accuracy: {topk_acc:.4f}")
+    wandb.log({f"top{args.topk}_pattern_acc": topk_acc})
+    wandb.run.summary[f"top{args.topk}_pattern_acc"] = topk_acc
+
     # --- 샘플링 예시 + GT/PRED 비교 이미지 업로드 ---
     model.eval()
     with torch.no_grad():
-        num_samples = min(32, len(X_test_t))   # 이미지로 올릴 샘플 수
-        idx = torch.randperm(len(X_test_t))[:num_samples]
+        num_samples = min(32, len(X_test_flat))   # 이미지로 올릴 샘플 수
+        idx = torch.randperm(len(X_test_flat))[:num_samples]
         Y_sample = Y_test_t[idx].to(device)
-        X_true   = X_test_t[idx].cpu().numpy()
-        X_gen    = sample_transformer_ar(model, Y_sample, num_bits=num_bits, greedy=False).cpu().numpy()
+        X_true   = X_test_flat[idx.numpy()]              # original ordering
+        X_gen    = sample_transformer_ar(
+            model, Y_sample, num_bits=num_bits,
+            greedy=False, ordering=args.ordering
+        ).cpu().numpy()                                  # original ordering
 
     # 4x4로 복원
     X_true_img = restore_pixel_order(X_true)  # (N,1,4,4)
@@ -399,7 +593,7 @@ def main(args):
 
     wandb.log({"GT_vs_Pred_Layouts": images})
 
-    print("👉 Example samples (first few, flatten):")
+    print("👉 Example samples (first few, flatten, original ordering):")
     print("True:")
     print(X_true[:8])
     print("Generated (sampled):")
@@ -416,19 +610,32 @@ if __name__ == "__main__":
     # Transformer 하이퍼파라미터 (기본값: 좀 더 큰 모델)
     parser.add_argument("--d_model", type=int, default=256)
     parser.add_argument("--nhead", type=int, default=8)
-    parser.add_argument("--num_layers", type=int, default=3)
-    parser.add_argument("--dim_ff", type=int, default=512)
-    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--num_layers", type=int, default=12)
+    parser.add_argument("--dim_ff", type=int, default=768)
+    parser.add_argument("--dropout", type=float, default=0.2)
+
+    # ordering / conditioning 옵션
+    parser.add_argument("--ordering", type=str, default="hilbert",
+                        choices=["raster", "snake", "hilbert"])
+    parser.add_argument("--spectral_cond", type=str, default="transformer",
+                        choices=["linear", "mlp", "transformer"])
 
     # 학습 하이퍼파라미터
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight_decay", type=float, default=0.0)
-    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=0.0001)
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=100)
+
+    parser.add_argument("--lr_scheduler", type=str, default="cosine",
+                        choices=["none", "cosine"])
+
+    # top-k evaluation
+    parser.add_argument("--topk", type=int, default=10,
+                        help="k for top-k pattern accuracy evaluation via sampling")
 
     # 입력 normalization 옵션
     parser.add_argument("--normalize_input", action="store_true",
-                        help="If set, per-sample normalize Y (zero mean, unit std).")
+                        help="If set, per-sample normalize Y (zero mean).")
 
     # W&B 옵션
     parser.add_argument("--project", type=str, default="rogers_inverse_ar")
@@ -436,4 +643,3 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     main(args)
-
