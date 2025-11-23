@@ -9,9 +9,24 @@ from torch.utils.data import TensorDataset, DataLoader
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import wandb
+import random
 
 BOS_IDX = 2   # 0,1: 실제 비트, 2: BOS 토큰
 H, W = 4, 4   # 4x4 패턴
+
+
+# ---------------------------
+# Seed 고정
+# ---------------------------
+def set_seed(seed: int):
+    print(f"🔒 Setting global seed = {seed}")
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # 더 deterministic하게 만들기 (약간 느려질 수 있음)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 # ---------------------------
@@ -106,6 +121,9 @@ class SmallTransformerAR(nn.Module):
           * 'linear'     : Linear(num_points → d_model)
           * 'mlp'        : 2-layer MLP
           * 'transformer': small Transformer encoder over freq dimension
+      - use_2d_pos:
+          * True  → 1D pos_embed + 2D pos2d_embed(chain→spatial index 기반) 둘 다 사용
+          * False → 기존 1D pos_embed만 사용
     """
     def __init__(
         self,
@@ -118,17 +136,34 @@ class SmallTransformerAR(nn.Module):
         vocab_size=3,    # 0,1,BOS
         dropout=0.1,
         spectral_cond="linear",   # 'linear' or 'mlp' or 'transformer'
+        use_2d_pos=False,
+        chain2spatial=None,       # Tensor of shape (max_len,), chain index -> spatial index (0..H*W-1)
+        height=H,
+        width=W,
     ):
         super().__init__()
         self.num_points = num_points
         self.d_model = d_model
         self.max_len = max_len
         self.spectral_cond_type = spectral_cond
+        self.use_2d_pos = use_2d_pos
+        self.height = height
+        self.width = width
 
         # 토큰/포지션/컨디션 임베딩
         self.token_embed = nn.Embedding(vocab_size, d_model)
-        self.pos_embed   = nn.Embedding(max_len, d_model)
+        self.pos_embed   = nn.Embedding(max_len, d_model)   # 1D (chain index)
 
+        # 2D positional embedding (optional)
+        if self.use_2d_pos:
+            assert chain2spatial is not None, "use_2d_pos=True 이면 chain2spatial을 넘겨줘야 합니다."
+            assert chain2spatial.numel() >= max_len
+            # 0..(H*W-1) spatial index용 embedding
+            self.pos2d_embed = nn.Embedding(height * width, d_model)
+            # chain position t → spatial index (original flatten index)
+            self.register_buffer("chain2spatial", chain2spatial.clone())  # shape: (max_len,)
+
+        # spectral condition encoder
         if spectral_cond == "linear":
             self.cond_encoder = nn.Linear(num_points, d_model)
         elif spectral_cond == "mlp":
@@ -143,7 +178,7 @@ class SmallTransformerAR(nn.Module):
             self.freq_pos_embed = nn.Embedding(num_points, d_model)
             cond_encoder_layer = nn.TransformerEncoderLayer(
                 d_model=d_model,
-                nhead=4,                   # 작은 헤드 수 (별도 하이퍼로 빼고 싶으면 인자로 추가 가능)
+                nhead=4,                   # 작은 헤드 수 (필요하면 옵션으로 뺄 수 있음)
                 dim_feedforward=dim_feedforward,
                 dropout=dropout,
                 batch_first=True
@@ -210,8 +245,17 @@ class SmallTransformerAR(nn.Module):
 
         tok_emb = self.token_embed(tokens)              # (B,L,d_model)
 
+        # 1D positional embedding (chain index)
         pos_idx = torch.arange(L, device=device).unsqueeze(0).expand(B, L)  # (B,L)
         pos_emb = self.pos_embed(pos_idx)               # (B,L,d_model)
+
+        # 2D positional embedding (optional)
+        if self.use_2d_pos:
+            # chain position t → spatial index (original flatten index 0..H*W-1)
+            spatial_idx = self.chain2spatial[:L].to(device)          # (L,)
+            spatial_idx = spatial_idx.unsqueeze(0).expand(B, L)      # (B,L)
+            pos2d_emb = self.pos2d_embed(spatial_idx)                # (B,L,d_model)
+            pos_emb = pos_emb + pos2d_emb
 
         cond_vec = self.encode_condition(y)             # (B,d_model)
         cond = cond_vec.unsqueeze(1).expand(B, L, self.d_model)  # (B,L,d_model)
@@ -398,6 +442,9 @@ def eval_topk_pattern_accuracy(model, Y_test_t, X_test_flat, k, device,
 # Main
 # ---------------------------
 def main(args):
+    # Seed 고정
+    set_seed(args.seed)
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"🟢 Using device: {device}")
 
@@ -459,11 +506,15 @@ def main(args):
         f"{args.run_prefix}-"
         f"L{args.num_layers}-d{args.d_model}-h{args.nhead}-ff{args.dim_ff}-"
         f"dr{args.dropout}-ord{args.ordering}-spec{args.spectral_cond}-"
-        f"lr{args.lr}-bs{args.batch_size}"
+        f"2dpos{int(args.use_2d_pos)}-"
+        f"lr{args.lr}-bs{args.batch_size}-seed{args.seed}"
     )
     wandb.init(project=args.project, name=run_name)
     # 하이퍼파라미터 sweep-friendly: 모든 args를 config에 기록
     wandb.config.update(vars(args))
+
+    # chain position → spatial index (original flat index) 텐서 (2D pos용)
+    chain2spatial = torch.from_numpy(order_idx).long()
 
     # --- Model / Loss / Optim / LR Scheduler ---
     model = SmallTransformerAR(
@@ -476,6 +527,10 @@ def main(args):
         vocab_size=3,
         dropout=args.dropout,
         spectral_cond=args.spectral_cond,
+        use_2d_pos=args.use_2d_pos,
+        chain2spatial=chain2spatial,
+        height=H,
+        width=W,
     ).to(device)
 
     print(model)
@@ -490,7 +545,7 @@ def main(args):
         )
 
     os.makedirs(args.save_dir, exist_ok=True)
-    #save_path = os.path.join(args.save_dir, "transformer_ar_inverse.pth")
+    # run별로 디렉토리 분리
     run_save_dir = os.path.join(args.save_dir, run_name)
     os.makedirs(run_save_dir, exist_ok=True)
     save_path = os.path.join(run_save_dir, "best_model.pth")
@@ -607,22 +662,25 @@ if __name__ == "__main__":
     parser.add_argument("--data_root", type=str, default="../data/Rogers_dataset")
     parser.add_argument("--save_dir", type=str, default="./transformer_ar_inverse_models")
 
-    # Transformer 하이퍼파라미터 (기본값: 좀 더 큰 모델)
+    # Transformer 하이퍼파라미터 (기본값: 너가 마지막에 쓴 값 유지)
     parser.add_argument("--d_model", type=int, default=256)
     parser.add_argument("--nhead", type=int, default=8)
     parser.add_argument("--num_layers", type=int, default=12)
     parser.add_argument("--dim_ff", type=int, default=768)
     parser.add_argument("--dropout", type=float, default=0.2)
 
-    # ordering / conditioning 옵션
+    # ordering / conditioning / 2D pos 옵션
     parser.add_argument("--ordering", type=str, default="hilbert",
                         choices=["raster", "snake", "hilbert"])
     parser.add_argument("--spectral_cond", type=str, default="transformer",
                         choices=["linear", "mlp", "transformer"])
+    parser.add_argument("--use_2d_pos", type=lambda x: x.lower()=="true",
+                    default=False,
+                    help="Use 2D positional encoding (True/False)")
 
     # 학습 하이퍼파라미터
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=0.0001)
+    parser.add_argument("--weight_decay", type=float, default=0.0000)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=100)
 
@@ -637,9 +695,16 @@ if __name__ == "__main__":
     parser.add_argument("--normalize_input", action="store_true",
                         help="If set, per-sample normalize Y (zero mean).")
 
+    # Seed 옵션
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Global random seed for reproducibility.")
+
     # W&B 옵션
     parser.add_argument("--project", type=str, default="rogers_inverse_ar")
     parser.add_argument("--run_prefix", type=str, default="ar")
 
     args = parser.parse_args()
     main(args)
+
+# python3 ./train_inverse_back.py --num_layers 6 --d_model 192 --nhead 4 --dim_ff 768 --dropout 0.1 --ordering hilbert --spectral_cond transformer --batch_size 128 --lr 0.0005 --lr_scheduler none --weight_decay 0 
+# 0.75117
