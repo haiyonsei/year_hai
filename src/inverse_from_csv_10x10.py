@@ -505,6 +505,7 @@ def main(args):
         height=H,
         width=W,
     )  # (K,num_bits) 0/1
+    X_candidates = X_candidates[:args.num_candidates]
     print(f"✅ Generated {X_candidates.shape[0]} candidates.")
 
     # --- canonical_target 옵션이 켜져 있으면, 좌우 대칭 canonicalization ---
@@ -516,19 +517,24 @@ def main(args):
     os.makedirs(args.output_dir, exist_ok=True)
     csv_stem = os.path.splitext(os.path.basename(args.csv_path))[0]
 
-    # --- 각 candidate에 대해 이미지 + npy 저장 ---
+    # --- 각 candidate에 대해 이미지 저장 + CSV용 row 만들기 ---
     X_imgs = restore_pixel_order(X_candidates, H, W)  # (K,1,H,W)
 
+    all_rows = []  # 각 candidate의 1D 패턴을 모아 둘 리스트
+
     for idx in range(X_candidates.shape[0]):
-        pattern_flat = X_candidates[idx]           # (num_bits,)
-        pattern_img  = X_imgs[idx, 0]             # (H,W)
+        pattern_flat = X_candidates[idx]     # (num_bits,)
+        pattern_img  = X_imgs[idx, 0]       # (H,W)
 
+        # 2D(HxW) -> bottom row 먼저, 그 다음 위 row ... → 1D 한 줄
+        pattern_2d_reordered = np.flipud(pattern_img)        # (H,W), 아래→위 순서로
+        pattern_1d = pattern_2d_reordered.reshape(1, -1)     # (1, H*W)
+
+        all_rows.append(pattern_1d)  # 나중에 한 번에 CSV로 저장
+
+        # 이미지 파일명: 입력 csv 이름 + candidate #
         base_name = f"{csv_stem}_candidate{idx}"
-        npy_path  = os.path.join(args.output_dir, base_name + ".npy")
         png_path  = os.path.join(args.output_dir, base_name + ".png")
-
-        # npy 저장
-        np.save(npy_path, pattern_flat.astype(np.float32))
 
         # 이미지 저장
         plt.figure(figsize=(3, 3))
@@ -539,7 +545,18 @@ def main(args):
         plt.savefig(png_path, dpi=150)
         plt.close()
 
-        print(f"💾 Saved candidate #{idx}: {npy_path}, {png_path}")
+        print(f"💾 Saved image for candidate #{idx}: {png_path}")
+
+    # --- 모든 candidates를 한 CSV로 저장 ---
+    # all_rows: [ (1,H*W), (1,H*W), ... ] -> (K, H*W)
+    all_rows_arr = np.vstack(all_rows)               # (K, H*W)
+    csv_path_all = os.path.join(args.output_dir, f"{csv_stem}_candidates.csv")
+
+    # 각 row = 한 candidate, 순서: 맨 아래 row → 맨 위 row 이어붙인 1D
+    np.savetxt(csv_path_all, all_rows_arr.astype(int), fmt="%d", delimiter=",")
+
+    print(f"💾 Saved all {X_candidates.shape[0]} candidates to CSV: {csv_path_all}")
+
 
     print("🎉 Done.")
 
@@ -595,10 +612,14 @@ if __name__ == "__main__":
     )
 
     # beam search / 출력 옵션
-    parser.add_argument("--beam_size", type=int, default=50,
+    parser.add_argument("--beam_size", type=int, default=200,
                         help="Beam size (K) for beam search (number of candidates).")
+    parser.add_argument("--num_candidates", type=int, default=50,
+                        help="number of candidates")
     parser.add_argument("--output_dir", type=str, default="./inverse_from_csv_outputs",
                         help="Directory to save candidate images and npy files.")
 
     args = parser.parse_args()
     main(args)
+
+# python3 ./inverse_from_csv_10x10.py --csv_path ../specs/desired/S_Parameter_Plot_60_1_1994.csv  --model_path ./transformer_ar_inverse_models/ar10x10-L9-d192-h4-ff768-dr0.1-ordhilbert-specresnet1d-2dpos0-canon1-lr0.0005-bs128-seed42/best_model.pth
