@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 import os
 import argparse
@@ -45,6 +46,41 @@ def restore_pixel_order(X_flat):
             mat[3 - row, :] = X_flat[i, row * 4:(row + 1) * 4]
         X_restored[i, 0] = mat
     return X_restored
+
+
+# ---------------------------
+# Canonicalization for y-axis symmetry
+# ---------------------------
+def horizontal_flip_y_axis(X_flat, height=H, width=W):
+    """
+    4x4 패턴을 y축(좌우) 대칭으로 플립.
+    X_flat: (N, 16), row-major (0..15) ordering 가정.
+    """
+    N = X_flat.shape[0]
+    X_reshaped = X_flat.reshape(N, height, width)
+    X_flipped = X_reshaped[:, :, ::-1]   # 열 방향 반전
+    return X_flipped.reshape(N, height * width)
+
+
+def canonicalize_under_yflip(X_flat, height=H, width=W):
+    """
+    각 패턴에 대해 y축 대칭 패턴을 만들고,
+    두 벡터 중 사전순(lexicographic)으로 작은 쪽을 canonical 정답으로 사용.
+    """
+    X_flat = X_flat.copy()
+    X_flip = horizontal_flip_y_axis(X_flat, height, width)
+    N = X_flat.shape[0]
+    X_can = np.empty_like(X_flat)
+
+    for i in range(N):
+        a = X_flat[i]
+        b = X_flip[i]
+        # 0 < 1 이라고 보고, 사전 순서 비교
+        if list(a) <= list(b):
+            X_can[i] = a
+        else:
+            X_can[i] = b
+    return X_can
 
 
 # ---------------------------
@@ -107,7 +143,54 @@ def get_order_indices(ordering, num_bits, height=H, width=W):
 
 
 # ---------------------------
-# 작은 Transformer AR 모델
+# 1D ResNet encoder for spectral condition
+# ---------------------------
+class ResNet1DEncoder(nn.Module):
+    """
+    y: (B, P) → (B, 1, P) → 1D ResNet → global average pooling → (B, d_model)
+    P(=num_points)는 201까지/그 이상도 자유롭게 처리 가능.
+    """
+    def __init__(self, d_model, num_blocks=3, kernel_size=3):
+        super().__init__()
+        padding = kernel_size // 2
+
+        self.input_proj = nn.Conv1d(1, d_model, kernel_size=kernel_size, padding=padding)
+        self.input_bn   = nn.BatchNorm1d(d_model)
+
+        blocks = []
+        for _ in range(num_blocks):
+            blocks.append(
+                nn.Sequential(
+                    nn.Conv1d(d_model, d_model, kernel_size=kernel_size, padding=padding),
+                    nn.BatchNorm1d(d_model),
+                    nn.ReLU(inplace=True),
+                    nn.Conv1d(d_model, d_model, kernel_size=kernel_size, padding=padding),
+                    nn.BatchNorm1d(d_model),
+                )
+            )
+        self.blocks = nn.ModuleList(blocks)
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, y):
+        """
+        y: (B, 1, P)
+        """
+        x = self.input_proj(y)        # (B, d_model, P)
+        x = self.input_bn(x)
+        x = self.act(x)
+
+        for block in self.blocks:
+            residual = x
+            out = block(x)
+            x = self.act(out + residual)
+
+        # global average pooling over length dimension
+        x = x.mean(dim=-1)           # (B, d_model)
+        return x
+
+
+# ---------------------------
+# 작은 Transformer AR 모델 (cond_vec + self-attention encoder)
 # ---------------------------
 class SmallTransformerAR(nn.Module):
     """
@@ -115,12 +198,14 @@ class SmallTransformerAR(nn.Module):
       - 입력 토큰: [BOS, x0, x1, ..., x14] (길이 L = 16, num_bits=16 가정)
       - 출력: 각 위치 t에서 '다음 비트 x_t'에 대한 logit (길이 L = 16)
         logits[:,0] -> x0, logits[:,1] -> x1, ..., logits[:,15] -> x15
+
       - 조건: y (S11 스펙트럼) → cond_encoder → d_model → 모든 토큰 embedding에 더함
       - causal mask 사용 (i 위치는 <= i만 attend)
       - spectral_cond:
           * 'linear'     : Linear(num_points → d_model)
           * 'mlp'        : 2-layer MLP
-          * 'transformer': small Transformer encoder over freq dimension
+          * 'transformer': small Transformer encoder over freq dimension + mean pooling
+          * 'resnet1d'   : 1D ResNet encoder over freq dimension + global pooling
       - use_2d_pos:
           * True  → 1D pos_embed + 2D pos2d_embed(chain→spatial index 기반) 둘 다 사용
           * False → 기존 1D pos_embed만 사용
@@ -135,7 +220,7 @@ class SmallTransformerAR(nn.Module):
         max_len=16,      # = num_bits
         vocab_size=3,    # 0,1,BOS
         dropout=0.1,
-        spectral_cond="linear",   # 'linear' or 'mlp' or 'transformer'
+        spectral_cond="linear",   # 'linear' or 'mlp' or 'transformer' or 'resnet1d'
         use_2d_pos=False,
         chain2spatial=None,       # Tensor of shape (max_len,), chain index -> spatial index (0..H*W-1)
         height=H,
@@ -150,7 +235,7 @@ class SmallTransformerAR(nn.Module):
         self.height = height
         self.width = width
 
-        # 토큰/포지션/컨디션 임베딩
+        # 토큰/포지션 임베딩
         self.token_embed = nn.Embedding(vocab_size, d_model)
         self.pos_embed   = nn.Embedding(max_len, d_model)   # 1D (chain index)
 
@@ -187,6 +272,9 @@ class SmallTransformerAR(nn.Module):
                 cond_encoder_layer,
                 num_layers=2
             )
+        elif spectral_cond == "resnet1d":
+            # y: (B, P) → (B,1,P) → ResNet1D → (B,d_model)
+            self.resnet1d = ResNet1DEncoder(d_model=d_model, num_blocks=3, kernel_size=3)
         else:
             raise ValueError(f"Unknown spectral_cond: {spectral_cond}")
 
@@ -217,6 +305,7 @@ class SmallTransformerAR(nn.Module):
         """
         if self.spectral_cond_type in ["linear", "mlp"]:
             return self.cond_encoder(y)  # (B,d_model)
+
         elif self.spectral_cond_type == "transformer":
             B, P = y.shape
             device = y.device
@@ -231,6 +320,13 @@ class SmallTransformerAR(nn.Module):
 
             cond_vec = h.mean(dim=1)               # (B,d_model) global average pooling
             return cond_vec
+
+        elif self.spectral_cond_type == "resnet1d":
+            # y: (B,P) -> (B,1,P)
+            y_seq = y.unsqueeze(1)
+            cond_vec = self.resnet1d(y_seq)        # (B,d_model)
+            return cond_vec
+
         else:
             raise RuntimeError("Invalid spectral_cond_type")
 
@@ -414,6 +510,7 @@ def eval_topk_pattern_accuracy(model, Y_test_t, X_test_flat, k, device,
     """
     각 test sample에 대해 k번 샘플링했을 때,
     그 중 하나라도 GT 패턴과 완전히 일치하면 correct로 카운트.
+    (GT는 이미 canonical_target 옵션에 의해 정규화 되었을 수 있음)
     """
     model.eval()
     N = Y_test_t.size(0)
@@ -466,6 +563,13 @@ def main(args):
     print(f"✅ Dataset loaded: train={len(X_train_flat)}, val={len(X_val_flat)}, test={len(X_test_flat)}, "
           f"num_points={num_points}, num_bits={num_bits}")
 
+    # --- canonical target (y축 대칭 포함) 옵션 ---
+    if args.canonical_target:
+        print("🔁 Applying canonicalization under y-axis flip to targets (X_train/X_val/X_test).")
+        X_train_flat = canonicalize_under_yflip(X_train_flat, height=H, width=W)
+        X_val_flat   = canonicalize_under_yflip(X_val_flat,   height=H, width=W)
+        X_test_flat  = canonicalize_under_yflip(X_test_flat,  height=H, width=W)
+
     # --- ordering: original → chain-order 로 permute ---
     order_idx = get_order_indices(args.ordering, num_bits, H, W)  # (16,)
     print(f"🔁 Using ordering = {args.ordering}, order_idx = {order_idx.tolist()}")
@@ -506,7 +610,7 @@ def main(args):
         f"{args.run_prefix}-"
         f"L{args.num_layers}-d{args.d_model}-h{args.nhead}-ff{args.dim_ff}-"
         f"dr{args.dropout}-ord{args.ordering}-spec{args.spectral_cond}-"
-        f"2dpos{int(args.use_2d_pos)}-"
+        f"2dpos{int(args.use_2d_pos)}-canon{int(args.canonical_target)}-"
         f"lr{args.lr}-bs{args.batch_size}-seed{args.seed}"
     )
     wandb.init(project=args.project, name=run_name)
@@ -540,9 +644,36 @@ def main(args):
 
     scheduler = None
     if args.lr_scheduler == "cosine":
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=args.epochs, eta_min=0.0
-        )
+        # 5 epoch warm-up @ lr_warmup, 이후 cosine annealing from lr_max(=args.lr) to 0
+        warmup_epochs = 5
+        lr_warmup = 1e-4
+        lr_max = args.lr
+        eta_min = 0.0
+
+        def lr_lambda(epoch):
+            """
+            epoch: 0-based index (LambdaLR 내부에서 사용)
+            우리가 원하는 것은:
+              - ep = 1..warmup_epochs: lr = lr_warmup
+              - ep = warmup_epochs+1 .. args.epochs: cosine(lr_max -> eta_min)
+            """
+            ep = epoch + 1  # 1-based
+            if ep <= warmup_epochs:
+                return lr_warmup / lr_max
+            # cosine 구간 길이
+            T = max(args.epochs - warmup_epochs, 1)
+            # t in [0,1]
+            if T > 1:
+                t = float(ep - warmup_epochs - 1) / float(T - 1)
+            else:
+                t = 0.0
+            cos_factor = 0.5 * (1.0 + np.cos(np.pi * t))  # 1 -> 0
+            # eta_min는 0이므로 cos_factor만 사용
+            return cos_factor
+
+        scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+        print(f"🔄 Using warm-up + cosine LR schedule: warmup_epochs={warmup_epochs}, "
+              f"lr_warmup={lr_warmup}, lr_max={lr_max}")
 
     os.makedirs(args.save_dir, exist_ok=True)
     # run별로 디렉토리 분리
@@ -621,7 +752,7 @@ def main(args):
         num_samples = min(32, len(X_test_flat))   # 이미지로 올릴 샘플 수
         idx = torch.randperm(len(X_test_flat))[:num_samples]
         Y_sample = Y_test_t[idx].to(device)
-        X_true   = X_test_flat[idx.numpy()]              # original ordering
+        X_true   = X_test_flat[idx.numpy()]              # original ordering (canonicalized일 수 있음)
         X_gen    = sample_transformer_ar(
             model, Y_sample, num_bits=num_bits,
             greedy=False, ordering=args.ordering
@@ -662,26 +793,32 @@ if __name__ == "__main__":
     parser.add_argument("--data_root", type=str, default="../data/Rogers_dataset")
     parser.add_argument("--save_dir", type=str, default="./transformer_ar_inverse_models")
 
-    # Transformer 하이퍼파라미터 (기본값: 너가 마지막에 쓴 값 유지)
-    parser.add_argument("--d_model", type=int, default=256)
-    parser.add_argument("--nhead", type=int, default=8)
-    parser.add_argument("--num_layers", type=int, default=12)
+    # Transformer 하이퍼파라미터
+    # (이전 best setting을 기본값으로 유지)
+    parser.add_argument("--d_model", type=int, default=192)
+    parser.add_argument("--nhead", type=int, default=4)
+    parser.add_argument("--num_layers", type=int, default=6)
     parser.add_argument("--dim_ff", type=int, default=768)
-    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--dropout", type=float, default=0.1)
 
     # ordering / conditioning / 2D pos 옵션
     parser.add_argument("--ordering", type=str, default="hilbert",
                         choices=["raster", "snake", "hilbert"])
-    parser.add_argument("--spectral_cond", type=str, default="transformer",
-                        choices=["linear", "mlp", "transformer"])
+    parser.add_argument("--spectral_cond", type=str, default="resnet1d",
+                        choices=["linear", "mlp", "transformer", "resnet1d"])
     parser.add_argument("--use_2d_pos", type=lambda x: x.lower()=="true",
-                    default=False,
-                    help="Use 2D positional encoding (True/False)")
+                        default=False,
+                        help="Use 2D positional encoding (True/False)")
+
+    # canonical target 옵션 (y축 대칭까지 같은 정답으로 간주하고, canonical 정답만 학습)
+    parser.add_argument("--canonical_target", action="store_true",
+                        help="If set, map each 4x4 pattern to a canonical representative "
+                             "under y-axis flip using lexicographic order.")
 
     # 학습 하이퍼파라미터
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=0.0000)
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=0.0005)   # cosine 쓸 때는 0.001로 override 권장
+    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=100)
 
     parser.add_argument("--lr_scheduler", type=str, default="cosine",
@@ -706,5 +843,17 @@ if __name__ == "__main__":
     args = parser.parse_args()
     main(args)
 
-# python3 ./train_inverse_back.py --num_layers 6 --d_model 192 --nhead 4 --dim_ff 768 --dropout 0.1 --ordering hilbert --spectral_cond transformer --batch_size 128 --lr 0.0005 --lr_scheduler none --weight_decay 0 
+# 기존 best (scheduler 없음):
+# python3 ./train_inverse.py --num_layers 6 --d_model 192 --nhead 4 --dim_ff 768 --dropout 0.1 \
+#   --ordering hilbert --spectral_cond transformer --batch_size 128 \
+#   --lr 0.0005 --lr_scheduler none --weight_decay 0
 # 0.75117
+
+# 새 scheduler 실험 예시:
+# python3 ./train_inverse.py --num_layers 6 --d_model 192 --nhead 4 --dim_ff 768 --dropout 0.1 \
+#   --ordering hilbert --spectral_cond resnet1d --batch_size 128 \
+#   --lr 0.001 --lr_scheduler cosine --weight_decay 0
+
+# ar-L6-d192-h4-ff768-dr0.1-ordhilbert-specresnet1d-2dpos0-canon1-lr0.0005-bs128-seed42 (0.84609)
+
+
