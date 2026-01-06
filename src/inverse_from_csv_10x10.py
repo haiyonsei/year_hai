@@ -10,6 +10,44 @@ import matplotlib.pyplot as plt
 BOS_IDX = 2   # 0,1: 실제 비트, 2: BOS 토큰
 
 
+def sample_transformer_ar(model, y, num_bits, greedy,
+                          ordering, height, width):
+    """
+    y: (B, num_points)
+    반환: X_flat: (B,num_bits) in {0,1}, original flatten ordering
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    y = y.to(device)
+    B = y.size(0)
+
+    tokens = torch.full((B, 1), BOS_IDX, dtype=torch.long, device=device)
+    bits_chain = []
+
+    with torch.no_grad():
+        for t in range(num_bits):
+            logits = model(y, tokens)      # (B, t+1)
+            next_logit = logits[:, -1]     # (B,)
+
+            probs = torch.sigmoid(next_logit)
+            if greedy:
+                x_t = (probs > 0.5).long()
+            else:
+                x_t = torch.bernoulli(probs).long()   # ★ 진짜 random sampling
+
+            bits_chain.append(x_t.unsqueeze(1))       # (B,1)
+            tokens = torch.cat([tokens, x_t.unsqueeze(1)], dim=1)
+
+    bits_chain = torch.cat(bits_chain, dim=1)        # (B,num_bits) in chain-order
+
+    # chain-order → original-order
+    order_idx_np = get_order_indices(ordering, num_bits, height, width)
+    order_idx = torch.from_numpy(order_idx_np).to(device)
+    bits_flat = torch.zeros_like(bits_chain)
+    bits_flat[:, order_idx] = bits_chain
+    return bits_flat.cpu().numpy()
+
+
 # ---------------------------
 # HxW 복원 (row-major, train 코드와 동일)
 # ---------------------------
@@ -494,21 +532,41 @@ def main(args):
     model.load_state_dict(state)
     model.eval()
 
-    # --- Beam search로 K개 candidate 생성 ---
-    print(f"🎯 Running beam search with beam_size={args.beam_size}...")
-    X_candidates = beam_search_inverse(
-        model,
-        y_in_t,
-        num_bits=num_bits,
-        beam_size=args.beam_size,
-        ordering=args.ordering,
-        height=H,
-        width=W,
-    )  # (K,num_bits) 0/1
-    X_candidates = X_candidates[:args.num_candidates]
+
+    # --- 후보 생성: beam search vs random sampling ---
+    if args.decode_method == "beam":
+        print(f"🎯 Running beam search with beam_size={args.beam_size}...")
+        X_candidates = beam_search_inverse(
+            model,
+            y_in_t,
+            num_bits=num_bits,
+            beam_size=args.beam_size,
+            ordering=args.ordering,
+            height=H,
+            width=W,
+        )  # (K,num_bits) 0/1  where K = beam_size
+        X_candidates = X_candidates[:args.num_candidates]
+
+    elif args.decode_method == "sampling":
+        print(f"🎲 Running random sampling with num_candidates={args.num_candidates}...")
+        # y_in_t: (1, num_points) → (num_candidates, num_points)
+        y_rep = y_in_t.repeat(args.num_candidates, 1)
+        X_candidates = sample_transformer_ar(
+            model,
+            y_rep,
+            num_bits=num_bits,
+            greedy=False,                # ★ 확률적으로 뽑기
+            ordering=args.ordering,
+            height=H,
+            width=W,
+        )  # (num_candidates, num_bits) 0/1
+
+    else:
+        raise ValueError(f"Unknown decode_method: {args.decode_method}")
+
     print(f"✅ Generated {X_candidates.shape[0]} candidates.")
 
-    # --- canonical_target 옵션이 켜져 있으면, 좌우 대칭 canonicalization ---
+        # --- canonical_target 옵션이 켜져 있으면, 좌우 대칭 canonicalization ---
     if args.canonical_target:
         print("🔁 Applying canonicalization under y-axis flip to generated candidates.")
         X_candidates = canonicalize_under_yflip(X_candidates, height=H, width=W)
@@ -596,6 +654,14 @@ if __name__ == "__main__":
         type=lambda x: x.lower() == "true",
         default=False,
         help="Use 2D positional encoding (True/False)",
+    )
+
+    parser.add_argument(
+        "--decode_method",
+        type=str,
+        default="beam",
+        choices=["beam", "sampling"],
+        help="How to generate candidates: 'beam' for beam search, 'sampling' for random sampling.",
     )
 
     # canonical_target / normalization 옵션
